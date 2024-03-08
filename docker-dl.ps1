@@ -1,3 +1,7 @@
+
+# example usage: powershell -ExecutionPolicy Bypass -File docker-dl.ps1 python:3.12-bookworm
+
+
 # Workaround for SelfSigned Cert an force TLS 1.2
 add-type @"
 	using System.Net;
@@ -13,20 +17,40 @@ add-type @"
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 [System.Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# use 'library/' prefix for 'official' images like postgres 
-$image = "atlassian/jira-software" 
-$tag = "8.13.2" 
+
+#Param
+#  (
+#     [parameter(Position=0, Mandatory=$true)]
+#     [String]
+#     $ImageTag
+#   )
+
+
+$image, $tag = $args[0].split(':')
+#$tgzname = $args[0] -replace '[\\/":*?<>|]'
+
+# assume library if path not specified
+if (-not $image.Contains("/")) {
+	$image = "library/"+$image
+}
+
+$simplename = (-join($image.split("/")[1], $tag)) -replace '[\\/":*?<>|]'
+$tgzname = (-join($simplename, ".tgz"))
+#$tgzname = (-join($image.split("/")[1], $tag, ".tgz")) -replace '[\\/":*?<>|]'
 
 $imageuri = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${image}:pull" 
 $taguri = "https://registry-1.docker.io/v2/${image}/manifests/${tag}"
 $bloburi = "https://registry-1.docker.io/v2/${image}/blobs/" 
 
-# generating folder to save image files 
-$path = "$image$tag" -replace '[\\/":*?<>|]'
-if (!(test-path $path)) { 
-	New-Item -ItemType Directory -Force -Path $path 
-} 
-
+# powershell doesn't seem to have a GetTempDirectory() option.
+# So get a file, delete it, and use it's name.  better way?
+$tmpDir = [System.IO.Path]::GetTempFileName()
+Remove-Item $tmpDir
+$null = New-Item -Path $tmpDir -ItemType 'Directory'
+if (-Not (Test-Path -Path "$tmpDir")) {
+	Write-Output "Unable to create tmp directory"
+	exit 1
+}
 # token request 
 $token = Invoke-WebRequest -Uri $imageuri | ConvertFrom-Json | Select -expand token 
 
@@ -39,7 +63,7 @@ $manifest = Invoke-Webrequest -Headers $headers -Method GET -Uri $taguri | Conve
 
 # downloading config json 
 $configSha = $manifest | Select -expand config | Select -expand digest 
-$config = ".\$path\config.json" 
+$config = "$tmpDir\config.json" 
 Invoke-Webrequest -Headers @{Authorization="Bearer $token"} -Method GET -Uri $bloburi$configSha -OutFile $config 
 
 # generating manifest.json 
@@ -49,14 +73,14 @@ $manifestJson.add("RepoTags",@("${image}:${tag}"))
 
 # downloading layers 
 $layers = $manifest | Select -expand layers | Select -expand digest 
-$blobtmp = ".\$path\blobtmp" 
+$blobtmp = "$tmpDir\blobtmp" 
 
 #downloading blobs 
 $layersJson = @() 
 foreach ($blobelement in $layers) { 
 	# making so name doesnt start with 'sha256:' 
 	$fileName = "$blobelement.gz" -replace 'sha256:' 
-	$newfile = ".\$path\$fileName" 
+	$newfile = "$tmpDir\$fileName" 
 	$layersJson += @($fileName) 
 
 	# token expired after 5 minutes, so requesting new one for every blob just in case 
@@ -72,9 +96,13 @@ Remove-Item $blobtmp
 
 # saving manifest.json 
 $manifestJson.add("Layers", $layersJson) 
-ConvertTo-Json -Depth 5 -InputObject @($manifestJson) | Out-File -Encoding ascii ".\$path\manifest.json" 
+ConvertTo-Json -Depth 5 -InputObject @($manifestJson) | Out-File -Encoding ascii "$tmpDir\manifest.json" 
+
+$null = Start-Process -NoNewWindow -Wait -FilePath "C:\windows\system32\tar.exe" -ArgumentList "-cvzf $tgzname -C $tmpDir ."
+Remove-Item $tmpDir -Force -Recurse
 
 # postprocessing
-echo "copy generated folder to your docker machine" 
-echo "tar -cvf imagename.tar *" 
-echo "docker load < imagename.tar"
+echo "To load into docker run:"
+echo "'docker load -i $tgzname'"
+echo "To load into WSL run:"
+echo "'wsl.exe --import $simplename %LOCALAPPDATA%\Packages\$simplename $tgzname'"
